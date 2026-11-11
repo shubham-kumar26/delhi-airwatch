@@ -25,7 +25,12 @@ def db_url():
 def q(sql, params=None):
     conn = psycopg2.connect(db_url().strip(), connect_timeout=30)
     try:
-        return pd.read_sql(sql, conn, params=params)
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        cur.close()
+        return pd.DataFrame(rows, columns=cols)
     finally:
         conn.close()
 
@@ -51,7 +56,8 @@ where aqi is not null
 order by station_id, ts desc
 """)
 latest["ts"] = pd.to_datetime(latest["ts"], utc=True)
-latest["aqi"] = pd.to_numeric(latest["aqi"])
+for c in ["aqi", "pm25", "pm10"]:
+    latest[c] = pd.to_numeric(latest[c])
 now = pd.Timestamp.now(tz="UTC")
 latest["hours_ago"] = ((now - latest["ts"]).dt.total_seconds() / 3600).round(1)
 latest["freshness"] = latest["hours_ago"].apply(
@@ -79,7 +85,44 @@ order by city, ts desc
 """)
 weather = weather.rename(columns={"temperature": "Temp (C)", "humidity": "Humidity (%)",
                                   "wind_speed": "Wind (km/h)", "wind_dir": "Wind dir (deg)"})
-st.dataframe(weather.drop(columns=["ts"]), hide_index=True, use_container_width=True)
+st.dataframe(weather.drop(columns=["ts"]), hide_index=True, width="stretch")
 
 # ---- 7-day trend ----
-st.subheader
+st.subheader("AQI over the last 7 days")
+trend = q("""
+select city, date_trunc('hour', ts) as hour, round(avg(aqi)) as aqi
+from station_aqi
+where aqi is not null and ts > now() - interval '7 days'
+group by 1, 2
+order by 2
+""")
+trend["aqi"] = pd.to_numeric(trend["aqi"])
+st.plotly_chart(px.line(trend, x="hour", y="aqi", color="city"), width="stretch")
+
+# ---- hour of day pattern ----
+st.subheader("Typical day: average PM2.5 by hour (Indian time)")
+c1, c2 = st.columns([1, 2])
+selected = c1.selectbox("City", sorted(latest["city"].unique()))
+skip = c1.checkbox("Exclude the Diwali period (7-10 Nov)", value=False)
+extra = ""
+if skip:
+    extra = "and (r.ts at time zone 'Asia/Kolkata')::date not between '2026-11-07' and '2026-11-10'"
+pattern = q(f"""
+select extract(hour from r.ts at time zone 'Asia/Kolkata')::int as hour_ist,
+       round(avg(r.pm25)::numeric, 0) as avg_pm25
+from readings r
+join stations s using (station_id)
+where s.city = %s and r.pm25 is not null {extra}
+group by 1
+order by 1
+""", params=(selected,))
+pattern["avg_pm25"] = pd.to_numeric(pattern["avg_pm25"])
+c2.plotly_chart(px.bar(pattern, x="hour_ist", y="avg_pm25"), width="stretch")
+
+# ---- station table ----
+st.subheader("All stations")
+table = latest[["city", "name", "aqi", "category", "pm25", "pm10", "hours_ago", "freshness"]] \
+    .sort_values(["city", "aqi"], ascending=[True, False])
+st.dataframe(table, hide_index=True, width="stretch")
+st.caption("Data: OpenAQ (government monitors) and Open-Meteo (weather). "
+           "Fresh = reading within 6 hours. Some readings during Diwali were extremely high.")
