@@ -82,4 +82,4 @@ weather = weather.rename(columns={"temperature": "Temp (C)", "humidity": "Humidi
 st.dataframe(weather.drop(columns=["ts"]), hide_index=True, use_container_width=True)
 
 # ---- 7-day trend ----
-st.subheade
+st.subheader
