@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 import psycopg2
 import plotly.express as px
@@ -35,6 +36,26 @@ def q(sql, params=None):
         conn.close()
 
 
+def write(statements):
+    """Run several (sql, params) statements in one transaction. Not cached."""
+    conn = psycopg2.connect(db_url().strip(), connect_timeout=30)
+    try:
+        cur = conn.cursor()
+        result = None
+        for sql, params in statements:
+            cur.execute(sql, params)
+            if cur.description:
+                result = cur.fetchall()
+        conn.commit()
+        cur.close()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def category(a):
     if pd.isna(a):
         return "n/a"
@@ -42,6 +63,24 @@ def category(a):
     return ("Good" if a <= 50 else "Satisfactory" if a <= 100 else "Moderate" if a <= 200
             else "Poor" if a <= 300 else "Very Poor" if a <= 400 else "Severe")
 
+
+# ---- unsubscribe link: ?unsubscribe=<token> ----
+token = st.query_params.get("unsubscribe")
+if token:
+    try:
+        res = write([
+            ("update subscribers set active = false where unsubscribe_token = %s "
+             "returning subscriber_id", (token,)),
+        ])
+        if res:
+            write([("insert into events (subscriber_id, event_type) values (%s, 'unsubscribe')",
+                    (res[0][0],))])
+            st.success("You have been unsubscribed. You will not get any more alert emails.")
+        else:
+            st.warning("This unsubscribe link is not valid.")
+    except Exception:
+        st.error("Something went wrong. Please try the link again in a few minutes.")
+    st.stop()
 
 st.title("AirWatch India")
 st.caption("Near real-time air quality for 36 stations in 5 cities. Updated hourly. "
@@ -76,6 +115,42 @@ for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
     col.metric(city_name, "n/a" if pd.isna(row["aqi"]) else int(row["aqi"]),
                f"{category(row['aqi'])} | {int(row['stations'])} stations", delta_color="off")
 
+# ---- email alert signup ----
+st.subheader("Get an email alert")
+st.write("Choose a city and an AQI limit. You will get an email when the city's AQI goes above it. "
+         "You can unsubscribe at any time using the link in each email.")
+with st.form("signup", clear_on_submit=True):
+    f1, f2, f3 = st.columns([2, 1, 1])
+    email = f1.text_input("Email address")
+    sub_city = f2.selectbox("City", sorted(latest["city"].unique()), key="sub_city")
+    limit = f3.select_slider("Alert me above AQI", options=[100, 150, 200, 250, 300, 350, 400],
+                             value=200, key="sub_limit")
+    consent = st.checkbox("I agree to receive air quality alert emails from AirWatch India "
+                          "and understand I can unsubscribe at any time.")
+    submitted = st.form_submit_button("Subscribe")
+
+if submitted:
+    email_clean = email.strip().lower()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_clean):
+        st.error("Please enter a valid email address.")
+    elif not consent:
+        st.error("Please tick the consent box to subscribe.")
+    else:
+        try:
+            res = write([
+                ("""insert into subscribers (email, city, aqi_limit, consent, active)
+                    values (%s, %s, %s, true, true)
+                    on conflict (email) do update set
+                      city = excluded.city, aqi_limit = excluded.aqi_limit,
+                      consent = true, active = true
+                    returning subscriber_id""", (email_clean, sub_city, int(limit))),
+            ])
+            write([("insert into events (subscriber_id, event_type, detail) values (%s, 'signup', %s)",
+                    (res[0][0], f"{sub_city} above {limit}"))])
+            st.success(f"Subscribed. You will get an email when {sub_city} goes above AQI {limit}.")
+        except Exception:
+            st.error("Sorry, signup failed. Please try again in a few minutes.")
+
 # ---- weather ----
 st.subheader("Current weather")
 weather = q("""
@@ -102,7 +177,7 @@ st.plotly_chart(px.line(trend, x="hour", y="aqi", color="city"), width="stretch"
 # ---- hour of day pattern ----
 st.subheader("Typical day: average PM2.5 by hour (Indian time)")
 c1, c2 = st.columns([1, 2])
-selected = c1.selectbox("City", sorted(latest["city"].unique()))
+selected = c1.selectbox("City", sorted(latest["city"].unique()), key="pattern_city")
 skip = c1.checkbox("Exclude the Diwali period (7-10 Nov)", value=False)
 extra = ""
 if skip:
