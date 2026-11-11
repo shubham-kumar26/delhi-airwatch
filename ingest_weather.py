@@ -14,26 +14,30 @@ CITIES = {
     "Kolkata": (22.5726, 88.3639),
     "Bengaluru": (12.9716, 77.5946),
 }
-
 def fetch(lat, lon):
     last = None
     for attempt in range(4):
-        r = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat, "longitude": lon,
-                "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m",
-                "past_days": PAST_DAYS, "forecast_days": 1, "timezone": "UTC",
-            },
-            timeout=60,
-        )
+        try:
+            r = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat, "longitude": lon,
+                    "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m",
+                    "past_days": PAST_DAYS, "forecast_days": 1, "timezone": "UTC",
+                },
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            last = type(e).__name__
+            time.sleep(10 * (attempt + 1))  # wait longer each time
+            continue
         last = r.status_code
         if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(15 * (attempt + 1))  # wait longer each time
+            time.sleep(15 * (attempt + 1))
             continue
         r.raise_for_status()
         return r.json()["hourly"]
-    raise RuntimeError(f"gave up after retries (last status {last})")
+    raise RuntimeError(f"gave up after retries (last: {last})")
 
 now = datetime.now(timezone.utc)
 conn = psycopg2.connect(DB, connect_timeout=30)
