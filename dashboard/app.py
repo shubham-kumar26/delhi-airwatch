@@ -38,7 +38,9 @@ st.caption("Near real-time air quality for 36 stations in 5 cities. Updated hour
 latest = q("""
     select distinct on (station_id) station_id, city, name, ts, pm25, pm10, aqi, category
     from station_aqi
+    where aqi is not null
     order by station_id, ts desc
+""")
 """)
 latest["ts"] = pd.to_datetime(latest["ts"], utc=True)
 latest["aqi"] = pd.to_numeric(latest["aqi"])
