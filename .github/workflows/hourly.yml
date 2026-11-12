@@ -8,7 +8,7 @@ on:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -21,6 +21,10 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Ingest latest pollution readings
         run: python ingest_latest.py
+      - name: Fill recent gaps (last 2 days of hourly data)
+        env:
+          DAYS: "2"
+        run: python backfill_history.py
       - name: Ingest weather (last 3 days)
         env:
           PAST_DAYS: "3"
