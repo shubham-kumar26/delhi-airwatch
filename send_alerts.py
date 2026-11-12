@@ -102,7 +102,7 @@ print("Current AQI by city:", {c: v[0] for c, v in city_aqi.items()})
 cur.execute("""
 select subscriber_id, email, city, aqi_limit, unsubscribe_token, last_alert_at
 from subscribers
-where active and consent
+where active and consent and confirmed
 """)
 subs = cur.fetchall()
 print("Active subscribers:", len(subs))
