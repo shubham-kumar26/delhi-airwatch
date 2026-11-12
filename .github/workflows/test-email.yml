@@ -8,8 +8,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+      SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
       DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
