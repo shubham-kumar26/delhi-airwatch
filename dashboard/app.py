@@ -3,28 +3,33 @@ import re
 import pandas as pd
 import psycopg2
 import plotly.express as px
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="AirWatch India", layout="wide")
 
 
-def db_url():
+def secret(name, required=False):
+    """Read a secret from Streamlit Cloud, or from the .env file on a laptop."""
     try:
-        return st.secrets["DATABASE_URL"]          # on Streamlit Cloud
+        return str(st.secrets[name]).strip()
     except Exception:
-        from dotenv import load_dotenv             # on your laptop
+        from dotenv import load_dotenv
         load_dotenv(r"C:\Users\HP\.env")
-        url = os.getenv("DATABASE_URL")
-        if not url:
-            st.error('DATABASE_URL not found. Add it under Settings > Secrets as: '
-                     'DATABASE_URL = "postgresql://..."')
+        value = (os.getenv(name) or "").strip()
+        if required and not value:
+            st.error(f'{name} not found. Add it under Settings > Secrets as: {name} = "..."')
             st.stop()
-        return url
+        return value
+
+
+def db_url():
+    return secret("DATABASE_URL", required=True)
 
 
 @st.cache_data(ttl=600)
 def q(sql, params=None):
-    conn = psycopg2.connect(db_url().strip(), connect_timeout=30)
+    conn = psycopg2.connect(db_url(), connect_timeout=30)
     try:
         cur = conn.cursor()
         cur.execute(sql, params)
@@ -38,7 +43,7 @@ def q(sql, params=None):
 
 def write(statements):
     """Run several (sql, params) statements in one transaction. Not cached."""
-    conn = psycopg2.connect(db_url().strip(), connect_timeout=30)
+    conn = psycopg2.connect(db_url(), connect_timeout=30)
     try:
         cur = conn.cursor()
         result = None
@@ -56,6 +61,34 @@ def write(statements):
         conn.close()
 
 
+def send_confirmation(to_email, token):
+    """Send the 'please confirm' email through Brevo."""
+    api_key = secret("BREVO_API_KEY")
+    sender = secret("SENDER_EMAIL")
+    base = secret("DASHBOARD_URL").rstrip("/")
+    if not api_key or not sender or not base:
+        raise RuntimeError("BREVO_API_KEY, SENDER_EMAIL or DASHBOARD_URL is missing")
+    link = f"{base}/?confirm={token}"
+    text = (
+        "Hello,\n\n"
+        "Someone (hopefully you) asked to receive air quality alerts from AirWatch India.\n\n"
+        f"Please confirm your email by opening this link:\n{link}\n\n"
+        "If you did not sign up, just ignore this email. You will not receive any alerts.\n"
+    )
+    r = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": api_key, "content-type": "application/json",
+                 "accept": "application/json"},
+        json={"sender": {"name": "AirWatch India", "email": sender},
+              "to": [{"email": to_email}],
+              "subject": "Please confirm your AirWatch India alerts",
+              "textContent": text},
+        timeout=30,
+    )
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Brevo error {r.status_code}")
+
+
 def category(a):
     if pd.isna(a):
         return "n/a"
@@ -63,6 +96,25 @@ def category(a):
     return ("Good" if a <= 50 else "Satisfactory" if a <= 100 else "Moderate" if a <= 200
             else "Poor" if a <= 300 else "Very Poor" if a <= 400 else "Severe")
 
+
+# ---- confirm link: ?confirm=<token> ----
+confirm_token = st.query_params.get("confirm")
+if confirm_token:
+    try:
+        res = write([
+            ("update subscribers set confirmed = true, active = true where confirm_token = %s "
+             "returning subscriber_id", (confirm_token,)),
+        ])
+        if res:
+            write([("insert into events (subscriber_id, event_type) values (%s, 'confirmed')",
+                    (res[0][0],))])
+            st.success("Your email is confirmed. You will now get an alert when your city's "
+                       "AQI goes above your limit.")
+        else:
+            st.warning("This confirmation link is not valid.")
+    except Exception:
+        st.error("Something went wrong. Please try the link again in a few minutes.")
+    st.stop()
 
 # ---- unsubscribe link: ?unsubscribe=<token> ----
 token = st.query_params.get("unsubscribe")
@@ -115,10 +167,11 @@ for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
     col.metric(city_name, "n/a" if pd.isna(row["aqi"]) else int(row["aqi"]),
                f"{category(row['aqi'])} | {int(row['stations'])} stations", delta_color="off")
 
-# ---- email alert signup ----
+# ---- email alert signup (double opt-in) ----
 st.subheader("Get an email alert")
 st.write("Choose a city and an AQI limit. You will get an email when the city's AQI goes above it. "
-         "You can unsubscribe at any time using the link in each email.")
+         "We will first send you a link to confirm your email. "
+         "You can unsubscribe at any time using the link in each alert.")
 with st.form("signup", clear_on_submit=True):
     f1, f2, f3 = st.columns([2, 1, 1])
     email = f1.text_input("Email address")
@@ -137,17 +190,47 @@ if submitted:
         st.error("Please tick the consent box to subscribe.")
     else:
         try:
-            res = write([
-                ("""insert into subscribers (email, city, aqi_limit, consent, active)
-                    values (%s, %s, %s, true, true)
-                    on conflict (email) do update set
-                      city = excluded.city, aqi_limit = excluded.aqi_limit,
-                      consent = true, active = true
-                    returning subscriber_id""", (email_clean, sub_city, int(limit))),
+            sid, ctoken = None, None
+            row = write([
+                ("""insert into subscribers (email, city, aqi_limit, consent, active, confirmed)
+                    values (%s, %s, %s, true, true, false)
+                    on conflict (email) do nothing
+                    returning subscriber_id, confirm_token""",
+                 (email_clean, sub_city, int(limit))),
             ])
-            write([("insert into events (subscriber_id, event_type, detail) values (%s, 'signup', %s)",
-                    (res[0][0], f"{sub_city} above {limit}"))])
-            st.success(f"Subscribed. You will get an email when {sub_city} goes above AQI {limit}.")
+            if row:
+                sid, ctoken = row[0]
+                write([("insert into events (subscriber_id, event_type, detail) values (%s, 'signup', %s)",
+                        (sid, f"{sub_city} above {limit}"))])
+            else:
+                existing = write([("select subscriber_id, active, confirmed from subscribers "
+                                   "where email = %s", (email_clean,))])
+                sid, is_active, is_confirmed = existing[0]
+                if is_active and is_confirmed:
+                    st.info("This email is already subscribed. To change your settings, unsubscribe "
+                            "using the link in an alert email, then sign up again.")
+                    sid = None
+                else:
+                    recent = write([("select 1 from events where subscriber_id = %s "
+                                     "and event_type = 'confirmation_sent' "
+                                     "and created_at > now() - interval '10 minutes'", (sid,))])
+                    if recent:
+                        st.info("A confirmation email was sent a moment ago. "
+                                "Please check your inbox and spam folder.")
+                        sid = None
+                    else:
+                        upd = write([("""update subscribers set city = %s, aqi_limit = %s,
+                                         consent = true, active = true, confirmed = false,
+                                         confirm_token = md5(random()::text || clock_timestamp()::text)
+                                         where subscriber_id = %s returning confirm_token""",
+                                      (sub_city, int(limit), sid))])
+                        ctoken = upd[0][0]
+            if sid:
+                send_confirmation(email_clean, ctoken)
+                write([("insert into events (subscriber_id, event_type, detail) values (%s, 'confirmation_sent', %s)",
+                        (sid, f"{sub_city} above {limit}"))])
+                st.success("Almost done. We sent you a confirmation email. Click the link in it to "
+                           "start receiving alerts (check your spam folder if you do not see it).")
         except Exception:
             st.error("Sorry, signup failed. Please try again in a few minutes.")
 
