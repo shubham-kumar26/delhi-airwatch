@@ -8,7 +8,7 @@ on:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -25,3 +25,9 @@ jobs:
         env:
           PAST_DAYS: "3"
         run: python ingest_weather.py
+      - name: Send alert emails
+        env:
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+        run: python send_alerts.py
