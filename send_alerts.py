@@ -1,24 +1,24 @@
-"""Send AQI alert emails to subscribers.
+"""Send AQI alert emails to subscribers using the Brevo email API.
 
 Usage:
   python send_alerts.py        send real alerts
   python send_alerts.py dry    show who would be emailed, send nothing
-  python send_alerts.py test   send one test email to the sending address
+  python send_alerts.py test   send one test email to the sender address
 """
 import os
 import sys
-import smtplib
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 
 import psycopg2
+import requests
 from dotenv import load_dotenv
 
 load_dotenv(r"C:\Users\HP\.env")  # laptop only; on GitHub the secrets are used instead
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "live"
-GMAIL = (os.getenv("GMAIL_ADDRESS") or "").strip()
-PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").replace(" ", "").strip()
+API_KEY = (os.getenv("BREVO_API_KEY") or "").strip()
+SENDER_EMAIL = (os.getenv("SENDER_EMAIL") or "").strip()
+SENDER_NAME = (os.getenv("SENDER_NAME") or "AirWatch India").strip()
 DASHBOARD = (os.getenv("DASHBOARD_URL") or "").strip().rstrip("/")
 DB = (os.getenv("DATABASE_URL") or "").strip()
 COOLDOWN_HOURS = 12
@@ -30,19 +30,27 @@ def category(a):
             else "Poor" if a <= 300 else "Very Poor" if a <= 400 else "Severe")
 
 
-def smtp_connect():
-    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60)
-    server.login(GMAIL, PASSWORD)
-    return server
+def send_email(to_addr, subject, text):
+    """Send one email through Brevo. Raises an error if Brevo refuses it."""
+    r = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": API_KEY, "content-type": "application/json",
+                 "accept": "application/json"},
+        json={
+            "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+            "to": [{"email": to_addr}],
+            "subject": subject,
+            "textContent": text,
+        },
+        timeout=30,
+    )
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Brevo error {r.status_code}: {r.text[:200]}")
 
 
-def build_email(to_addr, city, aqi, limit, newest, token):
+def alert_text(city, aqi, limit, newest, token):
     unsub = f"{DASHBOARD}/?unsubscribe={token}" if DASHBOARD else "(unsubscribe link unavailable)"
-    msg = EmailMessage()
-    msg["Subject"] = f"AirWatch alert: {city} AQI is {aqi} ({category(aqi)})"
-    msg["From"] = f"AirWatch India <{GMAIL}>"
-    msg["To"] = to_addr
-    msg.set_content(
+    return (
         f"Hello,\n\n"
         f"The air quality in {city} is now above your limit.\n\n"
         f"  Current AQI: {aqi} ({category(aqi)})\n"
@@ -56,28 +64,22 @@ def build_email(to_addr, city, aqi, limit, newest, token):
         f"You are receiving this because you signed up for alerts. "
         f"Unsubscribe at any time: {unsub}\n"
     )
-    return msg
 
 
 # ---------- test mode ----------
 if MODE == "test":
-    if not GMAIL or not PASSWORD:
-        raise SystemExit("GMAIL_ADDRESS or GMAIL_APP_PASSWORD is missing.")
-    msg = EmailMessage()
-    msg["Subject"] = "AirWatch India test email"
-    msg["From"] = f"AirWatch India <{GMAIL}>"
-    msg["To"] = GMAIL
-    msg.set_content("If you can read this, email sending works.")
-    with smtp_connect() as s:
-        s.send_message(msg)
-    print("Test email sent. Check the inbox (and spam folder) of the sending address.")
+    if not API_KEY or not SENDER_EMAIL:
+        raise SystemExit("BREVO_API_KEY or SENDER_EMAIL is missing.")
+    send_email(SENDER_EMAIL, "AirWatch India test email",
+               "If you can read this, email sending works.")
+    print("Test email sent. Check the inbox (and spam folder) of the sender address.")
     raise SystemExit(0)
 
 # ---------- live / dry mode ----------
 if not DB:
     raise SystemExit("DATABASE_URL is missing.")
-if MODE == "live" and (not GMAIL or not PASSWORD):
-    raise SystemExit("GMAIL_ADDRESS or GMAIL_APP_PASSWORD is missing.")
+if MODE == "live" and (not API_KEY or not SENDER_EMAIL):
+    raise SystemExit("BREVO_API_KEY or SENDER_EMAIL is missing.")
 
 conn = psycopg2.connect(DB, connect_timeout=30)
 cur = conn.cursor()
@@ -124,22 +126,19 @@ if MODE == "dry":
     raise SystemExit(0)
 
 sent = failed = 0
-if due:
-    server = smtp_connect()
-    for sid, email, city, aqi, limit, newest, token in due:
-        try:
-            server.send_message(build_email(email, city, aqi, limit,
-                                            newest.astimezone(IST), token))
-            cur.execute("update subscribers set last_alert_at = now() where subscriber_id = %s", (sid,))
-            cur.execute("insert into events (subscriber_id, event_type, detail) values (%s, 'alert_sent', %s)",
-                        (sid, f"{city} AQI {aqi} above {limit}"))
-            conn.commit()
-            sent += 1
-        except Exception as e:
-            conn.rollback()
-            failed += 1
-            print(f"  failed for subscriber {sid}: {str(e)[:100]}")
-    server.quit()
+for sid, email, city, aqi, limit, newest, token in due:
+    try:
+        send_email(email, f"AirWatch alert: {city} AQI is {aqi} ({category(aqi)})",
+                   alert_text(city, aqi, limit, newest.astimezone(IST), token))
+        cur.execute("update subscribers set last_alert_at = now() where subscriber_id = %s", (sid,))
+        cur.execute("insert into events (subscriber_id, event_type, detail) values (%s, 'alert_sent', %s)",
+                    (sid, f"{city} AQI {aqi} above {limit}"))
+        conn.commit()
+        sent += 1
+    except Exception as e:
+        conn.rollback()
+        failed += 1
+        print(f"  failed for subscriber {sid}: {str(e)[:150]}")
 
 cur.execute(
     "insert into pipeline_runs (source, rows_loaded, rows_flagged, status, note) values (%s,%s,%s,%s,%s)",
