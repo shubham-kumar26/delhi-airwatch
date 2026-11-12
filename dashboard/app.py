@@ -116,6 +116,44 @@ def category(a):
             else "Poor" if a <= 300 else "Very Poor" if a <= 400 else "Severe")
 
 
+def advice(aqi):
+    """General precautions for each CPCB AQI band (not medical advice)."""
+    if aqi <= 50:
+        tips = ["Air quality is good. A great time for outdoor exercise and fresh air.",
+                "Open your windows to ventilate your home."]
+    elif aqi <= 100:
+        tips = ["Air quality is acceptable. Most people can carry on as normal.",
+                "People with asthma or lung or heart conditions may notice mild discomfort."]
+    elif aqi <= 200:
+        tips = ["Children, older adults and people with asthma, lung or heart conditions "
+                "should reduce long or heavy outdoor exertion.",
+                "Keep any prescribed medicines handy.",
+                "Everyone else can stay active outdoors but may prefer shorter sessions."]
+    elif aqi <= 300:
+        tips = ["Everyone should cut down on prolonged or heavy outdoor activity. "
+                "Prefer indoor exercise.",
+                "Keep windows closed during the worst hours and use an air purifier if you have one.",
+                "If you go out, a well-fitted N95/FFP2-type mask helps. Ordinary cloth or surgical "
+                "masks do not filter fine particles well.",
+                "Children, older adults and people with heart or lung conditions should be extra careful."]
+    elif aqi <= 400:
+        tips = ["Avoid outdoor exercise. Limit time outside to what is necessary.",
+                "Wear a well-fitted N95/FFP2-type mask if you go out. Ordinary cloth or surgical "
+                "masks do not filter fine particles well.",
+                "Keep windows closed and use an air purifier if you have one.",
+                "Children, older adults and people with heart or lung conditions should stay "
+                "indoors as much as possible."]
+    else:
+        tips = ["Health alert for everyone. Stay indoors as much as you can and avoid all "
+                "outdoor exercise.",
+                "Keep windows and doors closed. Use an air purifier, or spend time in one "
+                "cleaner room, if you can.",
+                "For any essential trip outside, wear a well-fitted N95/FFP2-type mask.",
+                "If you or someone you care for has trouble breathing, chest pain or other severe "
+                "symptoms, contact a doctor or emergency services."]
+    return "\n".join("- " + t for t in tips)
+
+
 def send_welcome(sid, email, city, limit, unsub_token):
     """Right after confirmation: email the current AQI of the user's city."""
     # do not send twice if the confirmation link is opened again
@@ -144,12 +182,14 @@ def send_welcome(sid, email, city, limit, unsub_token):
     limit_line = (f"Your alert limit is {limit}. " +
                   ("The air is above your limit right now." if above else
                    "You will get an email when the AQI goes above it.") + "\n\n")
+    tips = (f"What you can do at this level:\n{advice(aqi)}\n\n" if aqi is not None else "")
     text = (
         "Hello,\n\nThank you for confirming your email for AirWatch India alerts.\n\n"
-        + now_line + limit_line +
+        + now_line + tips + limit_line +
         f"See live data: {base or 'the AirWatch India dashboard'}\n\n"
         "The AQI shown is a PM-based AQI (PM2.5 and PM10, CPCB method), updated every few hours "
-        "with a delay. It is for information only and is not medical advice.\n\n"
+        "with a delay. The tips are general precautions based on the CPCB AQI categories. "
+        "This email is for information only and is not medical advice.\n\n"
         f"Unsubscribe at any time: {unsub}\n"
     )
     subject = (f"AirWatch India: {city} AQI is {aqi} ({category(aqi)})" if aqi is not None
