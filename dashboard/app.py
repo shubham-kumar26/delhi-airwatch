@@ -116,6 +116,16 @@ def category(a):
             else "Poor" if a <= 300 else "Very Poor" if a <= 400 else "Severe")
 
 
+CAT_ORDER = ["Good", "Satisfactory", "Moderate", "Poor", "Very Poor", "Severe"]
+CAT_COLORS = {"Good": "#00B050", "Satisfactory": "#92D050", "Moderate": "#FFC000",
+              "Poor": "#FF7F27", "Very Poor": "#E53935", "Severe": "#7E0023"}
+
+
+def short_name(name):
+    """'Padmapukur, Howrah - WBPCB' -> 'Padmapukur, Howrah'"""
+    return str(name).split(" - ")[0]
+
+
 def advice(aqi):
     """General precautions for each CPCB AQI band (not medical advice)."""
     if aqi <= 50:
@@ -259,13 +269,14 @@ st.caption("Near real-time air quality for 36 stations in 5 cities. Updated hour
 
 # ---- latest reading per station (newest row that has an AQI) ----
 latest = q("""
-select distinct on (station_id) station_id, city, name, ts, pm25, pm10, aqi, category
+select distinct on (station_id) station_id, city, name, ts, pm25, pm10, pm25_24h, pm10_24h,
+       aqi, category
 from station_aqi
 where aqi is not null
 order by station_id, ts desc
 """)
 latest["ts"] = pd.to_datetime(latest["ts"], utc=True)
-for c in ["aqi", "pm25", "pm10"]:
+for c in ["aqi", "pm25", "pm10", "pm25_24h", "pm10_24h"]:
     latest[c] = pd.to_numeric(latest[c])
 now = pd.Timestamp.now(tz="UTC")
 latest["hours_ago"] = ((now - latest["ts"]).dt.total_seconds() / 3600).round(1)
@@ -280,16 +291,24 @@ st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST "
 st.subheader("Current AQI by city")
 fresh_rows = latest[latest["hours_ago"] <= 12]   # stale stations are left out of the average
 city_aqi = (fresh_rows.groupby("city")
-            .agg(aqi=("aqi", "mean"), stations=("station_id", "count")).round(0)
+            .agg(aqi=("aqi", "mean"), lo=("aqi", "min"), hi=("aqi", "max"),
+                 stations=("station_id", "count")).round(0)
             .reindex(sorted(latest["city"].unique())))
 city_aqi["stations"] = city_aqi["stations"].fillna(0)
 city_aqi = city_aqi.sort_values("aqi", ascending=False, na_position="last")
+worst_station = {}
+if len(fresh_rows):
+    idx = fresh_rows.groupby("city")["aqi"].idxmax()
+    worst_station = fresh_rows.loc[idx].set_index("city")["name"].to_dict()
 cols = st.columns(len(city_aqi))
 for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
     col.metric(city_name, "n/a" if pd.isna(row["aqi"]) else int(row["aqi"]),
                f"{category(row['aqi'])} | {int(row['stations'])} stations", delta_color="off")
+    if not pd.isna(row["aqi"]):
+        col.caption(f"Range across stations: {int(row['lo'])} to {int(row['hi'])}")
+        col.caption(f"Highest: {short_name(worst_station.get(city_name, ''))} ({int(row['hi'])})")
 st.caption("City AQI is the average of its stations' latest AQI. Stations whose latest reading "
-           "is more than 12 hours old are left out.")
+           "is more than 12 hours old are left out. Pick a city below to see every station.")
 
 # ---- email alert signup / settings (double opt-in) ----
 st.subheader("Get an email alert")
@@ -376,6 +395,33 @@ if submitted:
                                "start receiving alerts (check your spam folder if you do not see it).")
         except Exception:
             st.error("Sorry, signup failed. Please try again in a few minutes.")
+
+# ---- station explorer ----
+st.subheader("AQI by station")
+e1, e2 = st.columns([1, 2])
+ex_city = e1.selectbox("City", sorted(latest["city"].unique()), key="station_city")
+ex = latest[latest["city"] == ex_city].copy()
+ex["station"] = ex["name"].apply(short_name)
+ex["category"] = ex["aqi"].apply(category)
+ex = ex.sort_values("aqi", ascending=False)
+fig = px.bar(ex, x="aqi", y="station", orientation="h", color="category",
+             color_discrete_map=CAT_COLORS, category_orders={"category": CAT_ORDER},
+             hover_data={"aqi": True, "hours_ago": True, "freshness": True, "category": False},
+             labels={"aqi": "AQI", "station": ""})
+fig.update_yaxes(categoryorder="total ascending")
+fig.update_layout(legend_title_text="", height=max(260, 42 * len(ex) + 90))
+e2.plotly_chart(fig, width="stretch")
+
+pick = e1.selectbox("Station details", ex["station"].tolist(), key="station_pick")
+srow = ex[ex["station"] == pick].iloc[0]
+e1.metric(pick, int(srow["aqi"]), f"{srow['category']} | {srow['freshness']}", delta_color="off")
+e1.write(f"24-hour average PM2.5: **{srow['pm25_24h']:.0f}** µg/m³"
+         if pd.notna(srow["pm25_24h"]) else "24-hour average PM2.5: not available")
+e1.write(f"24-hour average PM10: **{srow['pm10_24h']:.0f}** µg/m³"
+         if pd.notna(srow["pm10_24h"]) else "24-hour average PM10: not available")
+with e1.expander("What you can do at this level"):
+    st.text(advice(float(srow["aqi"])))
+    st.caption("General precautions based on the CPCB AQI categories. Not medical advice.")
 
 # ---- weather ----
 st.subheader("Current weather")
