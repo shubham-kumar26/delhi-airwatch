@@ -278,12 +278,18 @@ st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST "
 
 # ---- city cards ----
 st.subheader("Current AQI by city")
-city_aqi = latest.groupby("city").agg(aqi=("aqi", "mean"), stations=("station_id", "count")).round(0)
-city_aqi = city_aqi.sort_values("aqi", ascending=False)
+fresh_rows = latest[latest["hours_ago"] <= 12]   # stale stations are left out of the average
+city_aqi = (fresh_rows.groupby("city")
+            .agg(aqi=("aqi", "mean"), stations=("station_id", "count")).round(0)
+            .reindex(sorted(latest["city"].unique())))
+city_aqi["stations"] = city_aqi["stations"].fillna(0)
+city_aqi = city_aqi.sort_values("aqi", ascending=False, na_position="last")
 cols = st.columns(len(city_aqi))
 for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
     col.metric(city_name, "n/a" if pd.isna(row["aqi"]) else int(row["aqi"]),
                f"{category(row['aqi'])} | {int(row['stations'])} stations", delta_color="off")
+st.caption("City AQI is the average of its stations' latest AQI. Stations whose latest reading "
+           "is more than 12 hours old are left out.")
 
 # ---- email alert signup / settings (double opt-in) ----
 st.subheader("Get an email alert")
