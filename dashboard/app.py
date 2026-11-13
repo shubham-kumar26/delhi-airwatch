@@ -287,6 +287,23 @@ newest = latest["ts"].max().tz_convert("Asia/Kolkata")
 st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST "
          f"(stations report with a delay of a few hours)")
 
+# ---- live hourly AQI: latest hour only, not capped at 500 (closer to what apps like aqi.in show) ----
+live = q("""
+select distinct on (r.station_id) r.station_id, s.city, s.name, r.ts, r.pm25, r.pm10,
+  round(greatest(
+    case when r.pm25 > 250 then 400 + (r.pm25 - 250) * 100.0 / 130 else pm25_sub(r.pm25) end,
+    case when r.pm10 > 430 then 400 + (r.pm10 - 430) * 100.0 / 80  else pm10_sub(r.pm10) end
+  ))::int as live_aqi
+from readings r
+join stations s using (station_id)
+where r.pm25 is not null or r.pm10 is not null
+order by r.station_id, r.ts desc
+""")
+live["ts"] = pd.to_datetime(live["ts"], utc=True)
+live["live_aqi"] = pd.to_numeric(live["live_aqi"])
+live["hours_ago"] = ((now - live["ts"]).dt.total_seconds() / 3600).round(1)
+live_city = live[live["hours_ago"] <= 12].groupby("city")["live_aqi"].mean().round(0)
+
 # ---- city cards ----
 st.subheader("Current AQI by city")
 fresh_rows = latest[latest["hours_ago"] <= 12]   # stale stations are left out of the average
@@ -307,8 +324,12 @@ for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
     if not pd.isna(row["aqi"]):
         col.caption(f"Range across stations: {int(row['lo'])} to {int(row['hi'])}")
         col.caption(f"Highest: {short_name(worst_station.get(city_name, ''))} ({int(row['hi'])})")
-st.caption("City AQI is the average of its stations' latest AQI. Stations whose latest reading "
-           "is more than 12 hours old are left out. Pick a city below to see every station.")
+        if city_name in live_city.index:
+            col.caption(f"Live hourly AQI: {int(live_city[city_name])}")
+st.caption("The big number is the official-style AQI: a 24-hour average, capped at 500, like the CPCB "
+           "index. Live hourly AQI uses only the latest hour and is not capped, so it reacts faster "
+           "and is closer to what apps like aqi.in show. City values average the stations whose "
+           "latest reading is under 12 hours old. Pick a city below to see every station.")
 
 # ---- email alert signup / settings (double opt-in) ----
 st.subheader("Get an email alert")
@@ -415,6 +436,11 @@ e2.plotly_chart(fig, width="stretch")
 pick = e1.selectbox("Station details", ex["station"].tolist(), key="station_pick")
 srow = ex[ex["station"] == pick].iloc[0]
 e1.metric(pick, int(srow["aqi"]), f"{srow['category']} | {srow['freshness']}", delta_color="off")
+lrow = live[live["name"] == srow["name"]]
+if len(lrow):
+    lv = lrow.iloc[0]
+    lv_time = lv["ts"].tz_convert("Asia/Kolkata")
+    e1.write(f"Live hourly AQI: **{int(lv['live_aqi'])}** (hour of {lv_time:%d %b, %I:%M %p} IST)")
 e1.write(f"24-hour average PM2.5: **{srow['pm25_24h']:.0f}** µg/m³"
          if pd.notna(srow["pm25_24h"]) else "24-hour average PM2.5: not available")
 e1.write(f"24-hour average PM10: **{srow['pm10_24h']:.0f}** µg/m³"
