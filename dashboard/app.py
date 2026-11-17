@@ -140,9 +140,19 @@ def us_index(c, bps):
     return ilo + (c - lo) * (ihi - ilo) / (hi - lo)
 
 
+CAT_EMOJI = {"Good": "🟢", "Satisfactory": "🟩", "Moderate": "🟨",
+             "Poor": "🟧", "Very Poor": "🟥", "Severe": "🟫"}
+
+
 def short_name(name):
     """'Padmapukur, Howrah - WBPCB' -> 'Padmapukur, Howrah'"""
     return str(name).split(" - ")[0]
+
+
+def trim(text, n=24):
+    """Keep card lines on one row so the cards stay aligned."""
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
 
 
 def advice(aqi):
@@ -306,6 +316,9 @@ newest = latest["ts"].max().tz_convert("Asia/Kolkata")
 age_h = (now - latest["ts"].max()).total_seconds() / 3600
 st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST, about {age_h:.0f} hours ago "
          f"(stations report with a delay of a few hours)")
+if age_h > 6:
+    st.warning(f"The newest reading is about {age_h:.0f} hours old, which is longer than usual. "
+               "The data pipeline may be delayed, so treat these numbers as slightly out of date.")
 
 # ---- live hourly AQI: latest hour only, not capped at 500 (closer to what apps like aqi.in show) ----
 live = q("""
@@ -346,11 +359,17 @@ if len(fresh_rows):
     worst_station = fresh_rows.loc[idx].set_index("city")["name"].to_dict()
 cols = st.columns(len(city_aqi))
 for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
-    col.metric(city_name, "n/a" if pd.isna(row["aqi"]) else int(row["aqi"]),
-               f"{category(row['aqi'])} | {int(row['stations'])} stations", delta_color="off")
+    card_cat = category(row["aqi"])
+    card_label = f"{CAT_EMOJI.get(card_cat, '')} {city_name}".strip()
+    card_value = "n/a" if pd.isna(row["aqi"]) else int(row["aqi"])
+    card_note = f"{card_cat} | {int(row['stations'])} stations"
+    try:
+        col.metric(card_label, card_value, card_note, delta_color="off", delta_arrow="off")
+    except TypeError:  # older Streamlit without delta_arrow
+        col.metric(card_label, card_value, card_note, delta_color="off")
     if not pd.isna(row["aqi"]):
         col.caption(f"Range across stations: {int(row['lo'])} to {int(row['hi'])}")
-        col.caption(f"Highest: {short_name(worst_station.get(city_name, ''))} ({int(row['hi'])})")
+        col.caption(f"Highest: {trim(short_name(worst_station.get(city_name, '')))} ({int(row['hi'])})")
         if city_name in live_city.index:
             us_txt = f" | US {int(us_city[city_name])}" if city_name in us_city.index and pd.notna(us_city[city_name]) else ""
             col.caption(f"Live hourly: CPCB {int(live_city[city_name])}{us_txt}")
