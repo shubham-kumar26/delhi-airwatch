@@ -121,6 +121,25 @@ CAT_COLORS = {"Good": "#00B050", "Satisfactory": "#92D050", "Moderate": "#FFC000
               "Poor": "#FF7F27", "Very Poor": "#E53935", "Severe": "#7E0023"}
 
 
+# US EPA breakpoints (PM2.5 uses the 2024 revision). Above the top band the same slope is
+# kept, so values above 500 are possible, as on aqi.in.
+US_PM25 = [(0, 9.0, 0, 50), (9.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
+           (55.5, 125.4, 151, 200), (125.5, 225.4, 201, 300), (225.5, 325.4, 301, 500)]
+US_PM10 = [(0, 54, 0, 50), (55, 154, 51, 100), (155, 254, 101, 150),
+           (255, 354, 151, 200), (355, 424, 201, 300), (425, 604, 301, 500)]
+
+
+def us_index(c, bps):
+    """US AQI sub-index for one pollutant concentration (not capped at 500)."""
+    if c is None or pd.isna(c):
+        return float("nan")
+    for lo, hi, ilo, ihi in bps:
+        if c <= hi:
+            return ilo + (max(c, lo) - lo) * (ihi - ilo) / (hi - lo)
+    lo, hi, ilo, ihi = bps[-1]
+    return ilo + (c - lo) * (ihi - ilo) / (hi - lo)
+
+
 def short_name(name):
     """'Padmapukur, Howrah - WBPCB' -> 'Padmapukur, Howrah'"""
     return str(name).split(" - ")[0]
@@ -284,7 +303,8 @@ latest["freshness"] = latest["hours_ago"].apply(
     lambda h: "Fresh" if h <= 6 else "Delayed" if h <= 24 else "Stale")
 
 newest = latest["ts"].max().tz_convert("Asia/Kolkata")
-st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST "
+age_h = (now - latest["ts"].max()).total_seconds() / 3600
+st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST, about {age_h:.0f} hours ago "
          f"(stations report with a delay of a few hours)")
 
 # ---- live hourly AQI: latest hour only, not capped at 500 (closer to what apps like aqi.in show) ----
@@ -301,8 +321,15 @@ order by r.station_id, r.ts desc
 """)
 live["ts"] = pd.to_datetime(live["ts"], utc=True)
 live["live_aqi"] = pd.to_numeric(live["live_aqi"])
+live["pm25"] = pd.to_numeric(live["pm25"])
+live["pm10"] = pd.to_numeric(live["pm10"])
 live["hours_ago"] = ((now - live["ts"]).dt.total_seconds() / 3600).round(1)
-live_city = live[live["hours_ago"] <= 12].groupby("city")["live_aqi"].mean().round(0)
+live["us_aqi"] = pd.concat([live["pm25"].apply(lambda c: us_index(c, US_PM25)),
+                            live["pm10"].apply(lambda c: us_index(c, US_PM10))],
+                           axis=1).max(axis=1).round()
+live_recent = live[live["hours_ago"] <= 12]
+live_city = live_recent.groupby("city")["live_aqi"].mean().round(0)
+us_city = live_recent.groupby("city")["us_aqi"].mean().round(0)
 
 # ---- city cards ----
 st.subheader("Current AQI by city")
@@ -325,11 +352,13 @@ for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
         col.caption(f"Range across stations: {int(row['lo'])} to {int(row['hi'])}")
         col.caption(f"Highest: {short_name(worst_station.get(city_name, ''))} ({int(row['hi'])})")
         if city_name in live_city.index:
-            col.caption(f"Live hourly AQI: {int(live_city[city_name])}")
-st.caption("The big number is the official-style AQI: a 24-hour average, capped at 500, like the CPCB "
-           "index. Live hourly AQI uses only the latest hour and is not capped, so it reacts faster "
-           "and is closer to what apps like aqi.in show. City values average the stations whose "
-           "latest reading is under 12 hours old. Pick a city below to see every station.")
+            us_txt = f" | US {int(us_city[city_name])}" if city_name in us_city.index and pd.notna(us_city[city_name]) else ""
+            col.caption(f"Live hourly: CPCB {int(live_city[city_name])}{us_txt}")
+st.caption("The big number is the official-style Indian (CPCB) AQI: a 24-hour average, capped at 500. "
+           "'Live hourly' uses only the latest hour and is not capped, so it reacts faster. It is "
+           "shown on the Indian (CPCB) scale and on the US EPA scale, which many apps such as aqi.in "
+           "use and which gives higher numbers at very high pollution. City values average the "
+           "stations whose latest reading is under 12 hours old. Pick a city below to see every station.")
 
 # ---- email alert signup / settings (double opt-in) ----
 st.subheader("Get an email alert")
@@ -440,7 +469,9 @@ lrow = live[live["name"] == srow["name"]]
 if len(lrow):
     lv = lrow.iloc[0]
     lv_time = lv["ts"].tz_convert("Asia/Kolkata")
-    e1.write(f"Live hourly AQI: **{int(lv['live_aqi'])}** (hour of {lv_time:%d %b, %I:%M %p} IST)")
+    us_val = f" | US scale **{int(lv['us_aqi'])}**" if pd.notna(lv["us_aqi"]) else ""
+    e1.write(f"Live hourly AQI: CPCB scale **{int(lv['live_aqi'])}**{us_val}")
+    e1.caption(f"Hour of {lv_time:%d %b, %I:%M %p} IST, about {lv['hours_ago']:.0f} hours ago")
 e1.write(f"24-hour average PM2.5: **{srow['pm25_24h']:.0f}** µg/m³"
          if pd.notna(srow["pm25_24h"]) else "24-hour average PM2.5: not available")
 e1.write(f"24-hour average PM10: **{srow['pm10_24h']:.0f}** µg/m³"
