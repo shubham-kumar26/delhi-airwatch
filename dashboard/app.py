@@ -1,44 +1,158 @@
-"""Send AQI emails to confirmed subscribers using the Brevo email API.
-
-Rules:
-  A. Threshold alert: at most one per subscriber per 24 hours (COOLDOWN_HOURS).
-  B. Worse-band alert: if the city's AQI moves into a worse category than the last alert,
-     send another one, but never closer than MIN_GAP_HOURS to the previous email.
-  C. Daily summary: subscribers who opted in get one short email each morning
-     (from DIGEST_HOUR_IST, Indian time). Someone who gets an alert in the same run
-     skips that day's summary.
-
-Usage:
-  python send_alerts.py        send real emails
-  python send_alerts.py dry    show who would be emailed, send nothing
-  python send_alerts.py test   send one test email to the sender address
-"""
 import os
-import sys
-from datetime import datetime, timedelta, timezone
-
+import re
+import pandas as pd
 import psycopg2
+import plotly.express as px
 import requests
-from dotenv import load_dotenv
+import streamlit as st
 
-load_dotenv(r"C:\Users\HP\.env")  # laptop only; on GitHub the secrets are used instead
+st.set_page_config(page_title="AirWatch India", layout="wide")
 
-MODE = sys.argv[1] if len(sys.argv) > 1 else "live"
-API_KEY = (os.getenv("BREVO_API_KEY") or "").strip()
-SENDER_EMAIL = (os.getenv("SENDER_EMAIL") or "").strip()
-SENDER_NAME = (os.getenv("SENDER_NAME") or "AirWatch India").strip()
-DASHBOARD = (os.getenv("DASHBOARD_URL") or "").strip().rstrip("/")
-DB = (os.getenv("DATABASE_URL") or "").strip()
-COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "24"))
-MIN_GAP_HOURS = float(os.getenv("MIN_GAP_HOURS", "3"))
-DIGEST_HOUR_IST = int(os.getenv("DIGEST_HOUR_IST", "8"))
-IST = timezone(timedelta(hours=5, minutes=30))
-BANDS = ["Good", "Satisfactory", "Moderate", "Poor", "Very Poor", "Severe"]
+
+def secret(name, required=False):
+    """Read a secret from Streamlit Cloud, or from the .env file on a laptop."""
+    try:
+        return str(st.secrets[name]).strip()
+    except Exception:
+        from dotenv import load_dotenv
+        load_dotenv(r"C:\Users\HP\.env")
+        value = (os.getenv(name) or "").strip()
+        if required and not value:
+            st.error(f'{name} not found. Add it under Settings > Secrets as: {name} = "..."')
+            st.stop()
+        return value
+
+
+def db_url():
+    return secret("DATABASE_URL", required=True)
+
+
+@st.cache_data(ttl=600)
+def q(sql, params=None):
+    conn = psycopg2.connect(db_url(), connect_timeout=30)
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        cur.close()
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        conn.close()
+
+
+def write(statements):
+    """Run several (sql, params) statements in one transaction. Not cached."""
+    conn = psycopg2.connect(db_url(), connect_timeout=30)
+    try:
+        cur = conn.cursor()
+        result = None
+        for sql, params in statements:
+            cur.execute(sql, params)
+            if cur.description:
+                result = cur.fetchall()
+        conn.commit()
+        cur.close()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def brevo_send(to_email, subject, text):
+    """Send one email through Brevo. Raises an error if it fails."""
+    api_key = secret("BREVO_API_KEY")
+    sender = secret("SENDER_EMAIL")
+    if not api_key or not sender:
+        raise RuntimeError("BREVO_API_KEY or SENDER_EMAIL is missing")
+    r = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": api_key, "content-type": "application/json",
+                 "accept": "application/json"},
+        json={"sender": {"name": "AirWatch India", "email": sender},
+              "to": [{"email": to_email}],
+              "subject": subject,
+              "textContent": text},
+        timeout=30,
+    )
+    if r.status_code not in (200, 201, 202):
+        raise RuntimeError(f"Brevo error {r.status_code}")
+
+
+def base_url():
+    return secret("DASHBOARD_URL").rstrip("/")
+
+
+def send_confirmation(to_email, token, city, limit, change=False):
+    """Send the 'please confirm' email."""
+    base = base_url()
+    if not base:
+        raise RuntimeError("DASHBOARD_URL is missing")
+    link = f"{base}/?confirm={token}"
+    if change:
+        subject = "Please confirm your new AirWatch India alert settings"
+        intro = (f"Someone (hopefully you) asked to change the alert settings for this email to: "
+                 f"{city}, alert above AQI {limit}.\n\n"
+                 f"Your current settings stay the same until you confirm.\n\n")
+    else:
+        subject = "Please confirm your AirWatch India alerts"
+        intro = (f"Someone (hopefully you) asked to receive air quality alerts from AirWatch India "
+                 f"for {city}, when the AQI goes above {limit}.\n\n")
+    text = (
+        "Hello,\n\n" + intro +
+        f"Please confirm by opening this link:\n{link}\n\n"
+        "If you did not ask for this, just ignore this email and nothing will change.\n"
+    )
+    brevo_send(to_email, subject, text)
 
 
 def category(a):
+    if pd.isna(a):
+        return "n/a"
+    a = float(a)
     return ("Good" if a <= 50 else "Satisfactory" if a <= 100 else "Moderate" if a <= 200
             else "Poor" if a <= 300 else "Very Poor" if a <= 400 else "Severe")
+
+
+CAT_ORDER = ["Good", "Satisfactory", "Moderate", "Poor", "Very Poor", "Severe"]
+CAT_COLORS = {"Good": "#00B050", "Satisfactory": "#92D050", "Moderate": "#FFC000",
+              "Poor": "#FF7F27", "Very Poor": "#E53935", "Severe": "#7E0023"}
+
+
+# US EPA breakpoints (PM2.5 uses the 2024 revision). Above the top band the same slope is
+# kept, so values above 500 are possible, as on aqi.in.
+US_PM25 = [(0, 9.0, 0, 50), (9.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
+           (55.5, 125.4, 151, 200), (125.5, 225.4, 201, 300), (225.5, 325.4, 301, 500)]
+US_PM10 = [(0, 54, 0, 50), (55, 154, 51, 100), (155, 254, 101, 150),
+           (255, 354, 151, 200), (355, 424, 201, 300), (425, 604, 301, 500)]
+
+
+def us_index(c, bps):
+    """US AQI sub-index for one pollutant concentration (not capped at 500)."""
+    if c is None or pd.isna(c):
+        return float("nan")
+    for lo, hi, ilo, ihi in bps:
+        if c <= hi:
+            return ilo + (max(c, lo) - lo) * (ihi - ilo) / (hi - lo)
+    lo, hi, ilo, ihi = bps[-1]
+    return ilo + (c - lo) * (ihi - ilo) / (hi - lo)
+
+
+CAT_EMOJI = {"Good": "🟢", "Satisfactory": "🟩", "Moderate": "🟨",
+             "Poor": "🟧", "Very Poor": "🟥", "Severe": "🟫"}
+
+
+def short_name(name):
+    """'Padmapukur, Howrah - WBPCB' -> 'Padmapukur, Howrah'"""
+    return str(name).split(" - ")[0]
+
+
+def trim(text, n=24):
+    """Keep card lines on one row so the cards stay aligned."""
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
 
 
 def advice(aqi):
@@ -79,181 +193,361 @@ def advice(aqi):
     return "\n".join("- " + t for t in tips)
 
 
-def send_email(to_addr, subject, text):
-    """Send one email through Brevo. Raises an error if Brevo refuses it."""
-    r = requests.post(
-        "https://api.brevo.com/v3/smtp/email",
-        headers={"api-key": API_KEY, "content-type": "application/json",
-                 "accept": "application/json"},
-        json={
-            "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-            "to": [{"email": to_addr}],
-            "subject": subject,
-            "textContent": text,
-        },
-        timeout=30,
-    )
-    if r.status_code not in (200, 201, 202):
-        raise RuntimeError(f"Brevo error {r.status_code}: {r.text[:200]}")
-
-
-def footer(token):
-    unsub = f"{DASHBOARD}/?unsubscribe={token}" if DASHBOARD else "(unsubscribe link unavailable)"
-    return (
-        f"See live data: {DASHBOARD or 'the AirWatch India dashboard'}\n\n"
-        f"The AQI shown is a PM-based AQI (PM2.5 and PM10, CPCB method), with a delay of a few "
-        f"hours. The tips are general precautions based on the CPCB AQI categories. This email "
-        f"is for information only and is not medical advice.\n\n"
-        f"You are receiving this because you signed up for AirWatch India. "
+def send_welcome(sid, email, city, limit, unsub_token):
+    """Right after confirmation: email the current AQI of the user's city."""
+    # do not send twice if the confirmation link is opened again
+    seen = write([("select 1 from events where subscriber_id = %s and event_type = 'welcome_sent' "
+                   "and created_at > now() - interval '30 minutes'", (sid,))])
+    if seen:
+        return
+    res = write([("""select round(avg(aqi))::int, max(ts) from (
+                       select distinct on (station_id) station_id, aqi, ts
+                       from station_aqi
+                       where aqi is not null and city = %s
+                       order by station_id, ts desc
+                     ) t where ts > now() - interval '12 hours'""", (city,))])
+    aqi, ts = (res[0] if res else (None, None))
+    base = base_url()
+    unsub = f"{base}/?unsubscribe={unsub_token}" if base else "(unsubscribe link unavailable)"
+    if aqi is None:
+        now_line = (f"We do not have a recent AQI reading for {city} right now. "
+                    f"Your alerts will start as soon as new data arrives.\n\n")
+        above = False
+    else:
+        when = pd.Timestamp(ts).tz_convert("Asia/Kolkata")
+        above = aqi > limit
+        now_line = (f"Current AQI in {city}: {aqi} ({category(aqi)})\n"
+                    f"Newest reading: {when:%d %b %Y, %I:%M %p} IST\n\n")
+    limit_line = (f"Your alert limit is {limit}. " +
+                  ("The air is above your limit right now." if above else
+                   "You will get an email when the AQI goes above it.") + "\n\n")
+    tips = (f"What you can do at this level:\n{advice(aqi)}\n\n" if aqi is not None else "")
+    text = (
+        "Hello,\n\nThank you for confirming your email for AirWatch India alerts.\n\n"
+        + now_line + tips + limit_line +
+        f"See live data: {base or 'the AirWatch India dashboard'}\n\n"
+        "The AQI shown is a PM-based AQI (PM2.5 and PM10, CPCB method), updated every few hours "
+        "with a delay. The tips are general precautions based on the CPCB AQI categories. "
+        "This email is for information only and is not medical advice.\n\n"
         f"Unsubscribe at any time: {unsub}\n"
     )
+    subject = (f"AirWatch India: {city} AQI is {aqi} ({category(aqi)})" if aqi is not None
+               else "Welcome to AirWatch India alerts")
+    brevo_send(email, subject, text)
+    stmts = [("insert into events (subscriber_id, event_type, detail) values (%s, 'welcome_sent', %s)",
+              (sid, f"{city} AQI {aqi}"))]
+    if above:
+        # this email already told them, so skip a duplicate alert on the next check
+        stmts.append(("update subscribers set last_alert_at = now(), last_alert_band = %s "
+                      "where subscriber_id = %s", (category(aqi), sid)))
+    write(stmts)
 
 
-def alert_text(city, aqi, limit, newest, token, worse_than):
-    extra = (f"The air has moved into a worse category since your last alert ({worse_than}).\n\n"
-             if worse_than else "")
-    return (
-        f"Hello,\n\n"
-        f"The air quality in {city} is now above your limit.\n\n"
-        f"  Current AQI: {aqi} ({category(aqi)})\n"
-        f"  Your limit:  {limit}\n"
-        f"  Newest reading: {newest:%d %b %Y, %I:%M %p} IST\n\n"
-        f"{extra}"
-        f"What you can do at this level:\n{advice(aqi)}\n\n" + footer(token)
-    )
-
-
-def digest_text(city, aqi, limit, newest, token):
-    status = ("It is above your alert limit." if aqi > limit
-              else "It is below your alert limit.")
-    return (
-        f"Good morning,\n\n"
-        f"Here is your daily air quality summary for {city}.\n\n"
-        f"  Current AQI: {aqi} ({category(aqi)})\n"
-        f"  Your limit:  {limit}. {status}\n"
-        f"  Newest reading: {newest:%d %b %Y, %I:%M %p} IST\n\n"
-        f"What you can do at this level:\n{advice(aqi)}\n\n" + footer(token)
-    )
-
-
-# ---------- test mode ----------
-if MODE == "test":
-    if not API_KEY or not SENDER_EMAIL:
-        raise SystemExit("BREVO_API_KEY or SENDER_EMAIL is missing.")
-    send_email(SENDER_EMAIL, "AirWatch India test email",
-               "If you can read this, email sending works.")
-    print("Test email sent. Check the inbox (and spam folder) of the sender address.")
-    raise SystemExit(0)
-
-# ---------- live / dry mode ----------
-if not DB:
-    raise SystemExit("DATABASE_URL is missing.")
-if MODE == "live" and (not API_KEY or not SENDER_EMAIL):
-    raise SystemExit("BREVO_API_KEY or SENDER_EMAIL is missing.")
-
-conn = psycopg2.connect(DB, connect_timeout=30)
-cur = conn.cursor()
-
-# current AQI per city, using each station's newest row with an AQI (within 12 hours)
-cur.execute("""
-select city, round(avg(aqi))::int as aqi, max(ts) as newest
-from (
-  select distinct on (station_id) station_id, city, ts, aqi
-  from station_aqi
-  where aqi is not null
-  order by station_id, ts desc
-) t
-where ts > now() - interval '12 hours'
-group by city
-""")
-city_aqi = {c: (a, n) for c, a, n in cur.fetchall()}
-print("Current AQI by city:", {c: v[0] for c, v in city_aqi.items()})
-
-# only confirmed, active subscribers who agreed to emails
-cur.execute("""
-select subscriber_id, email, city, aqi_limit, unsubscribe_token,
-       last_alert_at, last_alert_band, digest, last_digest_date
-from subscribers
-where active and consent and confirmed
-""")
-subs = cur.fetchall()
-print("Active confirmed subscribers:", len(subs))
-
-now = datetime.now(timezone.utc)
-now_ist = now.astimezone(IST)
-today_ist = now_ist.date()
-
-alerts, digests = [], []
-for sid, email, city, limit, token, last_alert, last_band, want_digest, last_digest in subs:
-    if city not in city_aqi:
-        continue
-    aqi, newest = city_aqi[city]
-
-    alert_due, worse_than = False, None
-    if aqi > limit:
-        if last_alert is None:
-            alert_due = True
+# ---- confirm link: ?confirm=<token> ----
+confirm_token = st.query_params.get("confirm")
+if confirm_token:
+    try:
+        res = write([
+            ("""update subscribers set
+                  city = coalesce(pending_city, city),
+                  aqi_limit = coalesce(pending_limit, aqi_limit),
+                  digest = coalesce(pending_digest, digest),
+                  pending_city = null, pending_limit = null, pending_digest = null,
+                  confirmed = true, active = true, last_alert_at = null
+                where confirm_token = %s
+                returning subscriber_id, city, aqi_limit, email, unsubscribe_token""",
+             (confirm_token,)),
+        ])
+        if res:
+            sid, c_city, c_limit, c_email, c_unsub = res[0]
+            write([("insert into events (subscriber_id, event_type, detail) values (%s, 'confirmed', %s)",
+                    (sid, f"{c_city} above {c_limit}"))])
+            st.success(f"Your email is confirmed. You will get an alert when {c_city}'s AQI "
+                       f"goes above {c_limit}.")
+            try:
+                send_welcome(sid, c_email, c_city, c_limit, c_unsub)
+                st.info("We have also emailed you the current AQI for your city.")
+            except Exception:
+                st.caption("Your alerts are on. (We could not send the welcome email just now.)")
         else:
-            hours = (now - last_alert).total_seconds() / 3600
-            worse = last_band in BANDS and BANDS.index(category(aqi)) > BANDS.index(last_band)
-            if hours >= COOLDOWN_HOURS:
-                alert_due = True
-            elif worse and hours >= MIN_GAP_HOURS:
-                alert_due, worse_than = True, last_band
-    if alert_due:
-        alerts.append((sid, email, city, aqi, limit, newest, token, worse_than))
-        continue  # no summary on a day they already get an alert in this run
+            st.warning("This confirmation link is not valid.")
+    except Exception:
+        st.error("Something went wrong. Please try the link again in a few minutes.")
+    st.stop()
 
-    if want_digest and now_ist.hour >= DIGEST_HOUR_IST and last_digest != today_ist:
-        digests.append((sid, email, city, aqi, limit, newest, token))
-
-print("Alerts due:", len(alerts), "| daily summaries due:", len(digests))
-if MODE == "dry":
-    for sid, email, city, aqi, limit, newest, token, worse_than in alerts:
-        why = f" (worse than {worse_than})" if worse_than else ""
-        print(f"  would ALERT subscriber {sid}: {city} AQI {aqi} above {limit}{why}")
-    for sid, email, city, aqi, limit, newest, token in digests:
-        print(f"  would send SUMMARY to subscriber {sid}: {city} AQI {aqi}")
-    raise SystemExit(0)
-
-sent_alerts = sent_digests = failed = 0
-
-for sid, email, city, aqi, limit, newest, token, worse_than in alerts:
+# ---- unsubscribe link: ?unsubscribe=<token> ----
+token = st.query_params.get("unsubscribe")
+if token:
     try:
-        send_email(email, f"AirWatch alert: {city} AQI is {aqi} ({category(aqi)})",
-                   alert_text(city, aqi, limit, newest.astimezone(IST), token, worse_than))
-        cur.execute("update subscribers set last_alert_at = now(), last_alert_band = %s "
-                    "where subscriber_id = %s", (category(aqi), sid))
-        cur.execute("insert into events (subscriber_id, event_type, detail) values (%s, 'alert_sent', %s)",
-                    (sid, f"{city} AQI {aqi} above {limit}"))
-        conn.commit()
-        sent_alerts += 1
-    except Exception as e:
-        conn.rollback()
-        failed += 1
-        print(f"  alert failed for subscriber {sid}: {str(e)[:150]}")
+        res = write([
+            ("update subscribers set active = false where unsubscribe_token = %s "
+             "returning subscriber_id", (token,)),
+        ])
+        if res:
+            write([("insert into events (subscriber_id, event_type) values (%s, 'unsubscribe')",
+                    (res[0][0],))])
+            st.success("You have been unsubscribed. You will not get any more alert emails.")
+        else:
+            st.warning("This unsubscribe link is not valid.")
+    except Exception:
+        st.error("Something went wrong. Please try the link again in a few minutes.")
+    st.stop()
 
-for sid, email, city, aqi, limit, newest, token in digests:
-    try:
-        send_email(email, f"AirWatch morning update: {city} AQI {aqi} ({category(aqi)})",
-                   digest_text(city, aqi, limit, newest.astimezone(IST), token))
-        cur.execute("update subscribers set last_digest_date = %s where subscriber_id = %s",
-                    (today_ist, sid))
-        cur.execute("insert into events (subscriber_id, event_type, detail) values (%s, 'digest_sent', %s)",
-                    (sid, f"{city} AQI {aqi}"))
-        conn.commit()
-        sent_digests += 1
-    except Exception as e:
-        conn.rollback()
-        failed += 1
-        print(f"  summary failed for subscriber {sid}: {str(e)[:150]}")
+st.title("AirWatch India")
+st.caption("Near real-time air quality for 36 stations in 5 cities. Updated hourly. "
+           "AQI shown is a PM-based AQI: CPCB method, 24-hour averages of PM2.5 and PM10, "
+           "at least 16 hours of data, highest sub-index wins.")
 
-cur.execute(
-    "insert into pipeline_runs (source, rows_loaded, rows_flagged, status, note) values (%s,%s,%s,%s,%s)",
-    ("email_alerts", sent_alerts + sent_digests, failed, "ok" if failed == 0 else "partial",
-     f"{len(subs)} subscribers, {sent_alerts} alerts, {sent_digests} summaries"),
-)
-conn.commit()
-cur.close()
-conn.close()
-print(f"Alerts sent: {sent_alerts} | summaries sent: {sent_digests} | failed: {failed}")
+# ---- latest reading per station (newest row that has an AQI) ----
+latest = q("""
+select distinct on (station_id) station_id, city, name, ts, pm25, pm10, pm25_24h, pm10_24h,
+       aqi, category
+from station_aqi
+where aqi is not null
+order by station_id, ts desc
+""")
+latest["ts"] = pd.to_datetime(latest["ts"], utc=True)
+for c in ["aqi", "pm25", "pm10", "pm25_24h", "pm10_24h"]:
+    latest[c] = pd.to_numeric(latest[c])
+now = pd.Timestamp.now(tz="UTC")
+latest["hours_ago"] = ((now - latest["ts"]).dt.total_seconds() / 3600).round(1)
+latest["freshness"] = latest["hours_ago"].apply(
+    lambda h: "Fresh" if h <= 6 else "Delayed" if h <= 24 else "Stale")
+
+newest = latest["ts"].max().tz_convert("Asia/Kolkata")
+age_h = (now - latest["ts"].max()).total_seconds() / 3600
+st.write(f"**Newest reading:** {newest:%d %b %Y, %I:%M %p} IST, about {age_h:.0f} hours ago "
+         f"(stations report with a delay of a few hours)")
+if age_h > 6:
+    st.warning(f"The newest reading is about {age_h:.0f} hours old, which is longer than usual. "
+               "The data pipeline may be delayed, so treat these numbers as slightly out of date.")
+
+# ---- live hourly AQI: latest hour only, not capped at 500 (closer to what apps like aqi.in show) ----
+live = q("""
+select distinct on (r.station_id) r.station_id, s.city, s.name, r.ts, r.pm25, r.pm10,
+  round(greatest(
+    case when r.pm25 > 250 then 400 + (r.pm25 - 250) * 100.0 / 130 else pm25_sub(r.pm25) end,
+    case when r.pm10 > 430 then 400 + (r.pm10 - 430) * 100.0 / 80  else pm10_sub(r.pm10) end
+  ))::int as live_aqi
+from readings r
+join stations s using (station_id)
+where r.pm25 is not null or r.pm10 is not null
+order by r.station_id, r.ts desc
+""")
+live["ts"] = pd.to_datetime(live["ts"], utc=True)
+live["live_aqi"] = pd.to_numeric(live["live_aqi"])
+live["pm25"] = pd.to_numeric(live["pm25"])
+live["pm10"] = pd.to_numeric(live["pm10"])
+live["hours_ago"] = ((now - live["ts"]).dt.total_seconds() / 3600).round(1)
+live["us_aqi"] = pd.concat([live["pm25"].apply(lambda c: us_index(c, US_PM25)),
+                            live["pm10"].apply(lambda c: us_index(c, US_PM10))],
+                           axis=1).max(axis=1).round()
+live_recent = live[live["hours_ago"] <= 12]
+live_city = live_recent.groupby("city")["live_aqi"].mean().round(0)
+us_city = live_recent.groupby("city")["us_aqi"].mean().round(0)
+
+# ---- city cards ----
+st.subheader("Current AQI by city")
+fresh_rows = latest[latest["hours_ago"] <= 12]   # stale stations are left out of the average
+city_aqi = (fresh_rows.groupby("city")
+            .agg(aqi=("aqi", "mean"), lo=("aqi", "min"), hi=("aqi", "max"),
+                 stations=("station_id", "count")).round(0)
+            .reindex(sorted(latest["city"].unique())))
+city_aqi["stations"] = city_aqi["stations"].fillna(0)
+city_aqi = city_aqi.sort_values("aqi", ascending=False, na_position="last")
+worst_station = {}
+if len(fresh_rows):
+    idx = fresh_rows.groupby("city")["aqi"].idxmax()
+    worst_station = fresh_rows.loc[idx].set_index("city")["name"].to_dict()
+cols = st.columns(len(city_aqi))
+for col, (city_name, row) in zip(cols, city_aqi.iterrows()):
+    card_cat = category(row["aqi"])
+    card_value = "n/a" if pd.isna(row["aqi"]) else int(row["aqi"])
+    card_note = f"{CAT_EMOJI.get(card_cat, '')} {card_cat} | {int(row['stations'])} stations".strip()
+    col.metric(city_name, card_value, card_note, delta_color="off")
+    if not pd.isna(row["aqi"]):
+        col.caption(f"Range across stations: {int(row['lo'])} to {int(row['hi'])}")
+        col.caption(f"Highest: {trim(short_name(worst_station.get(city_name, '')))} ({int(row['hi'])})")
+        if city_name in live_city.index:
+            us_txt = f" | US {int(us_city[city_name])}" if city_name in us_city.index and pd.notna(us_city[city_name]) else ""
+            col.caption(f"Live hourly: CPCB {int(live_city[city_name])}{us_txt}")
+st.caption("The big number is the official-style Indian (CPCB) AQI: a 24-hour average, capped at 500. "
+           "'Live hourly' uses only the latest hour and is not capped, so it reacts faster. It is "
+           "shown on the Indian (CPCB) scale and on the US EPA scale, which many apps such as aqi.in "
+           "use and which gives higher numbers at very high pollution. City values average the "
+           "stations whose latest reading is under 12 hours old. Pick a city below to see every station.")
+
+# ---- email alert signup / settings (double opt-in) ----
+st.subheader("Get an email alert")
+st.write("Choose a city and an AQI limit. You will get an email when the city's AQI goes above it. "
+         "We first send a link to confirm your email, and right after you confirm we email you "
+         "the current AQI. You get at most one alert a day, plus an extra one if the air gets "
+         "worse by a whole category. To change your settings later, submit this form again with "
+         "the same email and confirm the change. You can unsubscribe at any time using the link "
+         "in each email.")
+with st.form("signup", clear_on_submit=True):
+    f1, f2, f3 = st.columns([2, 1, 1])
+    email = f1.text_input("Email address")
+    sub_city = f2.selectbox("City", sorted(latest["city"].unique()), key="sub_city")
+    limit = f3.select_slider("Alert me above AQI", options=[100, 150, 200, 250, 300, 350, 400],
+                             value=200, key="sub_limit")
+    want_digest = st.checkbox("Also send me a short daily morning summary (about 8 AM IST)")
+    consent = st.checkbox("I agree to receive air quality alert emails from AirWatch India "
+                          "and understand I can unsubscribe at any time.")
+    submitted = st.form_submit_button("Subscribe")
+
+if submitted:
+    email_clean = email.strip().lower()
+    limit = int(limit)
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_clean):
+        st.error("Please enter a valid email address.")
+    elif not consent:
+        st.error("Please tick the consent box to subscribe.")
+    else:
+        try:
+            sid, ctoken, change = None, None, False
+            row = write([
+                ("""insert into subscribers (email, city, aqi_limit, consent, active, confirmed, digest)
+                    values (%s, %s, %s, true, true, false, %s)
+                    on conflict (email) do nothing
+                    returning subscriber_id, confirm_token""",
+                 (email_clean, sub_city, limit, want_digest)),
+            ])
+            if row:
+                sid, ctoken = row[0]
+                write([("insert into events (subscriber_id, event_type, detail) values (%s, 'signup', %s)",
+                        (sid, f"{sub_city} above {limit}"))])
+            else:
+                existing = write([("select subscriber_id, active, confirmed, city, aqi_limit, digest "
+                                   "from subscribers where email = %s", (email_clean,))])
+                sid, is_active, is_confirmed, cur_city, cur_limit, cur_digest = existing[0]
+                if (is_active and is_confirmed and cur_city == sub_city and cur_limit == limit
+                        and bool(cur_digest) == bool(want_digest)):
+                    st.info("This email is already subscribed with these settings.")
+                    sid = None
+                else:
+                    recent = write([("select 1 from events where subscriber_id = %s "
+                                     "and event_type = 'confirmation_sent' "
+                                     "and created_at > now() - interval '10 minutes'", (sid,))])
+                    if recent:
+                        st.info("A confirmation email was sent a moment ago. "
+                                "Please check your inbox and spam folder.")
+                        sid = None
+                    elif is_active and is_confirmed:
+                        # a settings change for a confirmed subscriber: wait for confirmation
+                        change = True
+                        upd = write([("""update subscribers set pending_city = %s, pending_limit = %s,
+                                         pending_digest = %s,
+                                         confirm_token = md5(random()::text || clock_timestamp()::text)
+                                         where subscriber_id = %s returning confirm_token""",
+                                      (sub_city, limit, bool(want_digest), sid))])
+                        ctoken = upd[0][0]
+                        write([("insert into events (subscriber_id, event_type, detail) values (%s, 'settings_change_requested', %s)",
+                                (sid, f"{sub_city} above {limit}"))])
+                    else:
+                        # not confirmed yet, or came back after unsubscribing: restart cleanly
+                        upd = write([("""update subscribers set city = %s, aqi_limit = %s,
+                                         digest = %s, consent = true, active = true, confirmed = false,
+                                         pending_city = null, pending_limit = null, pending_digest = null,
+                                         last_alert_at = null, last_alert_band = null,
+                                         confirm_token = md5(random()::text || clock_timestamp()::text)
+                                         where subscriber_id = %s returning confirm_token""",
+                                      (sub_city, limit, bool(want_digest), sid))])
+                        ctoken = upd[0][0]
+            if sid:
+                send_confirmation(email_clean, ctoken, sub_city, limit, change)
+                write([("insert into events (subscriber_id, event_type, detail) values (%s, 'confirmation_sent', %s)",
+                        (sid, f"{sub_city} above {limit}"))])
+                if change:
+                    st.success("We sent a confirmation email. Click the link in it to apply your new "
+                               "settings. Until then your current settings stay the same.")
+                else:
+                    st.success("Almost done. We sent you a confirmation email. Click the link in it to "
+                               "start receiving alerts (check your spam folder if you do not see it).")
+        except Exception:
+            st.error("Sorry, signup failed. Please try again in a few minutes.")
+
+# ---- station explorer ----
+st.subheader("AQI by station")
+e1, e2 = st.columns([1, 2])
+ex_city = e1.selectbox("City", sorted(latest["city"].unique()), key="station_city")
+ex = latest[latest["city"] == ex_city].copy()
+ex["station"] = ex["name"].apply(short_name)
+ex["category"] = ex["aqi"].apply(category)
+ex = ex.sort_values("aqi", ascending=False)
+fig = px.bar(ex, x="aqi", y="station", orientation="h", color="category",
+             color_discrete_map=CAT_COLORS, category_orders={"category": CAT_ORDER},
+             hover_data={"aqi": True, "hours_ago": True, "freshness": True, "category": False},
+             labels={"aqi": "AQI", "station": ""})
+fig.update_yaxes(categoryorder="total ascending")
+fig.update_layout(legend_title_text="", height=max(260, 42 * len(ex) + 90))
+e2.plotly_chart(fig, width="stretch")
+
+pick = e1.selectbox("Station details", ex["station"].tolist(), key="station_pick")
+srow = ex[ex["station"] == pick].iloc[0]
+e1.metric(pick, int(srow["aqi"]), f"{srow['category']} | {srow['freshness']}", delta_color="off")
+lrow = live[live["name"] == srow["name"]]
+if len(lrow):
+    lv = lrow.iloc[0]
+    lv_time = lv["ts"].tz_convert("Asia/Kolkata")
+    us_val = f" | US scale **{int(lv['us_aqi'])}**" if pd.notna(lv["us_aqi"]) else ""
+    e1.write(f"Live hourly AQI: CPCB scale **{int(lv['live_aqi'])}**{us_val}")
+    e1.caption(f"Hour of {lv_time:%d %b, %I:%M %p} IST, about {lv['hours_ago']:.0f} hours ago")
+e1.write(f"24-hour average PM2.5: **{srow['pm25_24h']:.0f}** µg/m³"
+         if pd.notna(srow["pm25_24h"]) else "24-hour average PM2.5: not available")
+e1.write(f"24-hour average PM10: **{srow['pm10_24h']:.0f}** µg/m³"
+         if pd.notna(srow["pm10_24h"]) else "24-hour average PM10: not available")
+with e1.expander("What you can do at this level"):
+    st.text(advice(float(srow["aqi"])))
+    st.caption("General precautions based on the CPCB AQI categories. Not medical advice.")
+
+# ---- weather ----
+st.subheader("Current weather")
+weather = q("""
+select distinct on (city) city, ts, temperature, humidity, wind_speed, wind_dir
+from weather
+order by city, ts desc
+""")
+weather = weather.rename(columns={"temperature": "Temp (C)", "humidity": "Humidity (%)",
+                                  "wind_speed": "Wind (km/h)", "wind_dir": "Wind dir (deg)"})
+st.dataframe(weather.drop(columns=["ts"]), hide_index=True, width="stretch")
+
+# ---- 7-day trend ----
+st.subheader("AQI over the last 7 days")
+trend = q("""
+select city, date_trunc('hour', ts) as hour, round(avg(aqi)) as aqi
+from station_aqi
+where aqi is not null and ts > now() - interval '7 days'
+group by 1, 2
+order by 2
+""")
+trend["aqi"] = pd.to_numeric(trend["aqi"])
+st.plotly_chart(px.line(trend, x="hour", y="aqi", color="city"), width="stretch")
+
+# ---- hour of day pattern ----
+st.subheader("Typical day: average PM2.5 by hour (Indian time)")
+c1, c2 = st.columns([1, 2])
+selected = c1.selectbox("City", sorted(latest["city"].unique()), key="pattern_city")
+skip = c1.checkbox("Exclude the Diwali period (7-10 Nov)", value=False)
+extra = ""
+if skip:
+    extra = "and (r.ts at time zone 'Asia/Kolkata')::date not between '2026-11-07' and '2026-11-10'"
+pattern = q(f"""
+select extract(hour from r.ts at time zone 'Asia/Kolkata')::int as hour_ist,
+       round(avg(r.pm25)::numeric, 0) as avg_pm25
+from readings r
+join stations s using (station_id)
+where s.city = %s and r.pm25 is not null {extra}
+group by 1
+order by 1
+""", params=(selected,))
+pattern["avg_pm25"] = pd.to_numeric(pattern["avg_pm25"])
+c2.plotly_chart(px.bar(pattern, x="hour_ist", y="avg_pm25"), width="stretch")
+
+# ---- station table ----
+st.subheader("All stations")
+table = latest[["city", "name", "aqi", "category", "pm25", "pm10", "hours_ago", "freshness"]] \
+    .sort_values(["city", "aqi"], ascending=[True, False])
+st.dataframe(table, hide_index=True, width="stretch")
+st.caption("Data: OpenAQ (government monitors) and Open-Meteo (weather). "
+           "Fresh = reading within 6 hours. Some readings during Diwali were extremely high.")
