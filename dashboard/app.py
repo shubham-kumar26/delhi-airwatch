@@ -3,6 +3,7 @@ import re
 import pandas as pd
 import psycopg2
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -523,6 +524,95 @@ order by 2
 """)
 trend["aqi"] = pd.to_numeric(trend["aqi"])
 st.plotly_chart(px.line(trend, x="hour", y="aqi", color="city"), width="stretch")
+
+# ---- forecast ----
+st.subheader("Forecast: next 24 hours (estimate)")
+fc_city = st.selectbox("City", sorted(latest["city"].unique()), key="forecast_city")
+fc = q("""
+select target_ts, model, predicted_pm25, made_at
+from forecasts
+where city = %s
+  and made_at = (select max(made_at) from forecasts where city = %s)
+order by target_ts
+""", params=(fc_city, fc_city))
+if fc.empty:
+    st.info("No forecast has been made yet. It appears after the next forecast run.")
+else:
+    fc["target_ts"] = pd.to_datetime(fc["target_ts"], utc=True)
+    fc["made_at"] = pd.to_datetime(fc["made_at"], utc=True)
+    fc["predicted_pm25"] = pd.to_numeric(fc["predicted_pm25"])
+    made = fc["made_at"].max().tz_convert("Asia/Kolkata")
+    blend = fc[fc["model"] == "blend"]
+    this_hour = pd.Timestamp.now(tz="UTC").floor("h")
+    upcoming = blend[(blend["target_ts"] >= this_hour) &
+                     (blend["target_ts"] < this_hour + pd.Timedelta(hours=24))]
+    if len(upcoming):
+        best = upcoming.loc[upcoming["predicted_pm25"].idxmin()]
+        worst = upcoming.loc[upcoming["predicted_pm25"].idxmax()]
+        b_t = best["target_ts"].tz_convert("Asia/Kolkata")
+        w_t = worst["target_ts"].tz_convert("Asia/Kolkata")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Expected cleanest hour (IST)", f"{b_t:%I:%M %p}")
+        k1.caption(f"Forecast PM2.5 about {best['predicted_pm25']:.0f} µg/m³")
+        k2.metric("Expected worst hour (IST)", f"{w_t:%I:%M %p}")
+        k2.caption(f"Forecast PM2.5 about {worst['predicted_pm25']:.0f} µg/m³")
+        k3.metric("Forecast made (IST)", f"{made:%d %b, %I:%M %p}")
+        k3.caption("Refreshed a few times a day.")
+
+    act = q("""
+    select ts, pm25 from city_hourly
+    where city = %s and ts > now() - interval '48 hours'
+    order by ts
+    """, params=(fc_city,))
+    act["ts"] = pd.to_datetime(act["ts"], utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    act["pm25"] = pd.to_numeric(act["pm25"])
+    figf = go.Figure()
+    figf.add_trace(go.Scatter(x=act["ts"], y=act["pm25"], mode="lines", name="Observed"))
+    for model, label, dash in [("blend", "Forecast (blend)", "solid"),
+                               ("prophet", "Prophet", "dot"),
+                               ("same_hour_yday", "Same hour yesterday", "dot")]:
+        d = fc[fc["model"] == model]
+        figf.add_trace(go.Scatter(
+            x=d["target_ts"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None),
+            y=d["predicted_pm25"], mode="lines", name=label,
+            line=dict(dash=dash, width=3 if model == "blend" else 1.5)))
+    figf.update_layout(yaxis_title="PM2.5 (µg/m³)", xaxis_title="Indian time",
+                       legend_title_text="", height=380)
+    st.plotly_chart(figf, width="stretch")
+    st.caption("The forecast is the average of Prophet and the same hour yesterday. It captures the "
+               "usual daily pattern but can miss sudden events such as firecracker nights or smoke "
+               "episodes. Estimate only.")
+
+st.markdown("**Forecast report card: how accurate has it really been?**")
+score = q("""
+select city, model, count(*) as hours, avg(abs_err) as mae
+from forecast_scores
+where hours_ahead >= 0 and target_ts > now() - interval '14 days'
+group by 1, 2
+""")
+score["hours"] = pd.to_numeric(score["hours"])
+score["mae"] = pd.to_numeric(score["mae"])
+if score.empty or score["hours"].sum() < 40:
+    st.info("The report card fills in as forecast hours pass and the real readings arrive. "
+            f"Scored so far: {int(score['hours'].sum()) if len(score) else 0} forecast-hours "
+            "(it needs a day or two).")
+else:
+    names = {"blend": "Blend (the forecast above)", "prophet": "Prophet",
+             "same_hour_yday": "Same hour yesterday", "persistence": "Last value stays"}
+    tot = (score.assign(w=score["mae"] * score["hours"])
+           .groupby("model").agg(hours=("hours", "sum"), w=("w", "sum")))
+    tot["Average error (µg/m³)"] = (tot["w"] / tot["hours"]).round(1)
+    if "persistence" in tot.index:
+        base = tot.loc["persistence", "Average error (µg/m³)"]
+        tot["Better than 'last value stays' by"] = ((1 - tot["Average error (µg/m³)"] / base) * 100).round(0).astype(int).astype(str) + "%"
+    tot = tot.drop(columns=["w"]).rename(columns={"hours": "Forecast-hours scored"})
+    tot.index = [names.get(i, i) for i in tot.index]
+    st.dataframe(tot.sort_values("Average error (µg/m³)"), width="stretch")
+    piv = (score.pivot(index="city", columns="model", values="mae").round(1)
+           .rename(columns=names))
+    st.caption("Average error by city (µg/m³, lower is better), forecasts for the last 14 days:")
+    st.dataframe(piv, width="stretch")
+    st.caption("Only forecast hours that were still in the future when the forecast was made are scored.")
 
 # ---- hour of day pattern ----
 st.subheader("Typical day: average PM2.5 by hour (Indian time)")
